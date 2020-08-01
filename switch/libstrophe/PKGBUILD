@@ -1,0 +1,50 @@
+# Maintainer:  Luis Scheurenbrand <LuisScheurenbrand@gmail.com>
+
+pkgname=switch-libstrophe
+pkgver=0.9.3
+pkgrel=1
+pkgdesc='A simple, lightweight C library for writing XMPP clients '
+arch=('any')
+url='https://strophe.im/libstrophe/'
+license=(MIT or GPLv3)
+options=(!strip libtool staticlibs)
+depends=("switch-libxml2" "libnx")
+makedepends=('devkitpro-pkgbuild-helpers')
+source=(
+  "https://github.com/strophe/libstrophe/releases/download/$pkgver/libstrophe-$pkgver.tar.xz"
+  "libstrophe-${pkgver}.patch"
+)
+groups=('switch-portlibs')
+
+sha256sums=(
+  '4c70433b8c5b87ec482feae3491c8ead6dc56c221bd79047db74f491ae9f6f0b'
+  '0d0411a59a9532b69964b6d691339b6395e561e74d55906a0ed71021b511117f'
+)
+
+build() {
+  cd libstrophe-$pkgver
+
+  source /opt/devkitpro/switchvars.sh
+
+  patch -Np1 -i "$srcdir/libstrophe-${pkgver}.patch"
+
+  ./bootstrap.sh
+
+  CFLAGS="${CFLAGS} -D__SWITCH__ " \
+    ./configure --prefix="${PORTLIBS_PREFIX}" --host=aarch64-none-elf \
+    --disable-shared --enable-static
+
+  make
+}
+
+package() {
+  cd libstrophe-$pkgver
+
+  make DESTDIR="$pkgdir" install
+
+  # license
+  install -Dm644 "LICENSE.txt" "$pkgdir/$PORTLIBS_PREFIX/licenses/$pkgname/LICENSE.txt"
+  install -Dm644 "GPL-LICENSE.txt" "$pkgdir/$PORTLIBS_PREFIX/licenses/$pkgname/GPL-LICENSE.txt"
+  install -Dm644 "MIT-LICENSE.txt" "$pkgdir/$PORTLIBS_PREFIX/licenses/$pkgname/MIT-LICENSE.txt"
+}
+

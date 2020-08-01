@@ -1,0 +1,789 @@
+diff --git a/Makefile.am b/Makefile.am
+index fc29372..b2f5e15 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -5,9 +5,6 @@ ACLOCAL_AMFLAGS = -I m4
+ PARSER_CFLAGS=@PARSER_CFLAGS@
+ PARSER_LIBS=@PARSER_LIBS@
+ 
+-SSL_CFLAGS = @openssl_CFLAGS@
+-SSL_LIBS = @openssl_LIBS@
+-
+ RESOLV_LIBS = @RESOLV_LIBS@
+ 
+ STROPHE_FLAGS = -I$(top_srcdir) -Wall -Wextra -Wno-unused-parameter
+@@ -60,7 +57,7 @@ libstrophe_la_SOURCES += \
+ if DISABLE_TLS
+ libstrophe_la_SOURCES += src/tls_dummy.c
+ else
+-libstrophe_la_SOURCES += src/tls_openssl.c
++libstrophe_la_SOURCES += src/tls_libnx.c
+ endif
+ 
+ if PARSER_EXPAT
+diff --git a/configure.ac b/configure.ac
+index d182462..f5b562c 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -7,33 +7,11 @@ AC_PROG_CC
+ AM_PROG_CC_C_O
+ PKG_PROG_PKG_CONFIG
+ 
+-AC_CANONICAL_HOST
+-AS_CASE([$host_os],
+-    [freebsd*],    [PLATFORM="bsd"],
+-    [openbsd*],    [PLATFORM="bsd"],
+-    [netbsd*],     [PLATFORM="bsd"],
+-    [*nto*|*qnx*], [PLATFORM="qnx"],
+-    [*solaris*],   [PLATFORM="solaris"],
+-    [*android*],   [PLATFORM="android"],
+-                   [PLATFORM="nix"])
+-
+ AC_ARG_WITH([libxml2],
+     [AS_HELP_STRING([--with-libxml2], [use libxml2 for XML parsing, expat is the default])])
+ AC_ARG_ENABLE([tls],
+     [AS_HELP_STRING([--disable-tls], [disable TLS support])])
+ 
+-if test "x$enable_tls" != xno; then
+-    PKG_CHECK_MODULES([openssl], [openssl],
+-        [PC_REQUIRES="openssl ${PC_REQUIRES}"],
+-        [AC_CHECK_HEADER([openssl/ssl.h],
+-            [
+-                openssl_LIBS="-lssl -lcrypto"
+-                PC_LIBS="${openssl_LIBS} ${PC_LIBS}"
+-            ],
+-            [AC_MSG_ERROR([openssl not found; openssl required])]
+-        )])
+-fi
+-
+ with_parser=""
+ if test "x$with_libxml2" != xyes; then
+     PKG_CHECK_MODULES([expat], [expat >= 2.0.0],
+@@ -84,32 +62,6 @@ AC_MSG_NOTICE([libstrophe will use the $with_parser XML parser])
+ 
+ AC_SEARCH_LIBS([socket], [socket])
+ 
+-AS_CASE([$PLATFORM],
+-    [bsd],     [RESOLV_LIBS=""],
+-    [qnx],     [RESOLV_LIBS="-lsocket"],
+-    [solaris], [RESOLV_LIBS="-lresolv -lsocket -lnsl"],
+-    [android], [RESOLV_LIBS=""],
+-               [RESOLV_LIBS="-lresolv"])
+-
+-LIBS_TMP="${LIBS}"
+-LIBS="${RESOLV_LIBS}"
+-AC_LINK_IFELSE([AC_LANG_SOURCE([
+-        #include <sys/types.h>
+-        #include <netinet/in.h>
+-        #include <arpa/nameser.h>
+-        #include <resolv.h>
+-        #include <netdb.h>
+-
+-        int main() {
+-            (void)res_query(NULL, 0, 0, NULL, 0);
+-            return 0;
+-        }
+-    ])],
+-    [],
+-    [AC_MSG_ERROR([res_query() not found with LIBS="${LIBS}"])])
+-LIBS="${LIBS_TMP}"
+-PC_LIBS="${RESOLV_LIBS} ${PC_LIBS}"
+-
+ m4_ifdef([PKG_INSTALLDIR], [PKG_INSTALLDIR],
+     [AC_ARG_WITH([pkgconfigdir],
+         [AS_HELP_STRING([--with-pkgconfigdir],
+diff --git a/examples/vcard.c b/examples/vcard.c
+index 47d3d4c..2f2c506 100644
+--- a/examples/vcard.c
++++ b/examples/vcard.c
+@@ -251,13 +251,11 @@ int main(int argc, char **argv)
+     vcard_t      vcard;
+ 
+     if (argc < 4 || argc > 5) {
+-        prog = argc > 0 ? strdup(argv[0]) : NULL;
+         printf("Usage: %s <login-jid> <password> <recipient-jid> "
+-               "[image-file]\n\n", prog == NULL ? "vcard" : basename(prog));
++               "[image-file]\n\n", argv[0]);
+         printf("If vCard contains a photo it will be stored to "
+                "image-file. If you don't provide the image-file "
+                "default filename will be generated.\n");
+-        free(prog);
+         return 1;
+     }
+ 
+diff --git a/src/common.h b/src/common.h
+index e53e4ff..b68c09b 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -91,6 +91,7 @@ void xmpp_debug(const xmpp_ctx_t * const ctx,
+ typedef enum {
+     XMPP_STATE_DISCONNECTED,
+     XMPP_STATE_CONNECTING,
++    XMPP_STATE_PROXY,
+     XMPP_STATE_CONNECTED
+ } xmpp_conn_state_t;
+ 
+@@ -181,8 +182,14 @@ struct _xmpp_conn_t {
+ 
+     char *lang;
+     char *domain;
++    char *base_domain;
++    int port;
+     char *jid;
+     char *pass;
++    char *proxy_host;
++    int proxy_port;
++    char *proxy_user;
++    char *proxy_pass;
+     char *bound_jid;
+     char *stream_id;
+ 
+diff --git a/src/conn.c b/src/conn.c
+index 91413d5..f7f0b8b 100644
+--- a/src/conn.c
++++ b/src/conn.c
+@@ -127,8 +127,14 @@ xmpp_conn_t *xmpp_conn_new(xmpp_ctx_t * const ctx)
+             return NULL;
+         }
+         conn->domain = NULL;
++        conn->base_domain = NULL;
++        conn->port = 0;
+         conn->jid = NULL;
+         conn->pass = NULL;
++        conn->proxy_host = NULL;
++        conn->proxy_port = 0;
++        conn->proxy_user = NULL;
++        conn->proxy_pass = NULL;
+         conn->stream_id = NULL;
+         conn->bound_jid = NULL;
+ 
+@@ -319,6 +325,10 @@ int xmpp_conn_release(xmpp_conn_t * const conn)
+ 
+         parser_free(conn->parser);
+ 
++        if (conn->base_domain) xmpp_free(ctx, conn->base_domain);
++        if (conn->proxy_host) xmpp_free(ctx, conn->proxy_host);
++        if (conn->proxy_user) xmpp_free(ctx, conn->proxy_user);
++        if (conn->proxy_pass) xmpp_free(ctx, conn->proxy_pass);
+         if (conn->jid) xmpp_free(ctx, conn->jid);
+         if (conn->pass) xmpp_free(ctx, conn->pass);
+         if (conn->lang) xmpp_free(ctx, conn->lang);
+@@ -405,6 +415,45 @@ void xmpp_conn_set_pass(xmpp_conn_t * const conn, const char * const pass)
+     conn->pass = xmpp_strdup(conn->ctx, pass);
+ }
+ 
++/** Set a proxy used to connect.
++ *  If any host was previously set, it will be discarded.  The function
++ *  will make a copy of the host string.
++ *
++ *  @param conn a Strophe connection object
++ *  @param host the proxy host
++ *  @param port the proxy port
++ *
++ *  @ingroup Connections
++ */
++void xmpp_conn_set_proxy(xmpp_conn_t *const conn,
++                         const char *const host,
++                         const int port)
++{
++    if (conn->proxy_host) xmpp_free(conn->ctx, conn->proxy_host);
++    conn->proxy_host = host ? xmpp_strdup(conn->ctx, host) : NULL;
++    conn->proxy_port = port;
++}
++
++/** Set the username and password used to authenticate the proxy connection.
++ *  If any username or password was previously set, it will be discarded.
++ *  The function will make a copy of the username and password string.
++ *
++ *  @param conn a Strophe connection object
++ *  @param user the username
++ *  @param pass the password
++ *
++ *  @ingroup Connections
++ */
++void xmpp_conn_set_proxy_auth(xmpp_conn_t *const conn,
++                              const char *const user,
++                              const char *const pass)
++{
++    if (conn->proxy_user) xmpp_free(conn->ctx, conn->proxy_user);
++    if (conn->proxy_pass) xmpp_free(conn->ctx, conn->proxy_pass);
++    conn->proxy_user = user ? xmpp_strdup(conn->ctx, user) : NULL;
++    conn->proxy_pass = pass ? xmpp_strdup(conn->ctx, pass) : NULL;
++}
++
+ /** Get the strophe context that the connection is associated with.
+ *  @param conn a Strophe connection object
+ * 
+@@ -723,6 +772,7 @@ void conn_parser_reset(xmpp_conn_t * const conn)
+ void xmpp_disconnect(xmpp_conn_t * const conn)
+ {
+     if (conn->state != XMPP_STATE_CONNECTING &&
++        conn->state != XMPP_STATE_PROXY &&
+         conn->state != XMPP_STATE_CONNECTED)
+         return;
+ 
+@@ -889,7 +939,8 @@ int conn_tls_start(xmpp_conn_t * const conn)
+     }
+ 
+     if (conn->tls != NULL) {
+-        if (tls_start(conn->tls)) {
++        if (tls_set_credentials(conn->tls, conn->base_domain) &&
++            tls_start(conn->tls)) {
+             conn->secured = 1;
+         } else {
+             rc = XMPP_EINT;
+@@ -1257,36 +1308,73 @@ static int _conn_connect(xmpp_conn_t * const conn,
+     if (type != XMPP_CLIENT && type != XMPP_COMPONENT) return XMPP_EINVOP;
+     if (host == NULL || port == 0) return XMPP_EINT;
+ 
++    conn->base_domain = xmpp_strdup(conn->ctx, host);
++    conn->port = port;
++
+     _conn_reset(conn);
+ 
+     conn->type = type;
+     conn->domain = xmpp_strdup(conn->ctx, domain);
+     if (!conn->domain) return XMPP_EMEM;
+ 
+-    conn->sock = sock_connect(host, port);
+-    xmpp_debug(conn->ctx, "xmpp", "sock_connect() to %s:%u returned %d",
+-               host, port, conn->sock);
+-    if (conn->sock == -1) return XMPP_EINT;
+-    if (conn->ka_timeout || conn->ka_interval)
+-        sock_set_keepalive(conn->sock, conn->ka_timeout, conn->ka_interval);
+-
+-    /* setup handler */
+-    conn->conn_handler = callback;
+-    conn->userdata = userdata;
+-
+-    open_handler = conn->is_raw ? auth_handle_open_stub :
+-                   type == XMPP_CLIENT ? auth_handle_open :
+-                                         auth_handle_component_open;
+-    conn_prepare_reset(conn, open_handler);
+-
+-    /* FIXME: it could happen that the connect returns immediately as
+-     * successful, though this is pretty unlikely.  This would be a little
+-     * hard to fix, since we'd have to detect and fire off the callback
+-     * from within the event loop */
+-
+-    conn->state = XMPP_STATE_CONNECTING;
+-    conn->timeout_stamp = time_stamp();
+-    xmpp_debug(conn->ctx, "xmpp", "Attempting to connect to %s", host);
++    if (conn->proxy_host) {
++        conn->sock = sock_connect(conn->proxy_host, conn->proxy_port);
++        xmpp_debug(conn->ctx, "xmpp",
++                   "sock_connect(proxy) to %s:%u returned %d", conn->proxy_host,
++                   conn->proxy_port, conn->sock);
++
++        if (conn->sock == -1)
++            return XMPP_EINT;
++        if (conn->ka_timeout || conn->ka_interval)
++            sock_set_keepalive(conn->sock, conn->ka_timeout, conn->ka_interval);
++
++        /* setup handler */
++        conn->conn_handler = callback;
++        conn->userdata = userdata;
++
++        open_handler = conn->is_raw
++                           ? auth_handle_open_stub
++                           : type == XMPP_CLIENT ? auth_handle_open
++                                                 : auth_handle_component_open;
++        conn_prepare_reset(conn, open_handler);
++
++        /* FIXME: it could happen that the connect returns immediately as
++         * successful, though this is pretty unlikely.  This would be a little
++         * hard to fix, since we'd have to detect and fire off the callback
++         * from within the event loop */
++
++        conn->state = XMPP_STATE_PROXY;
++        conn->timeout_stamp = time_stamp();
++        xmpp_debug(conn->ctx, "xmpp", "Attempting to proxy connect to %s",
++                   conn->proxy_host);
++    } else {
++        conn->sock = sock_connect(conn->base_domain, conn->port);
++        xmpp_debug(conn->ctx, "xmpp", "sock_connect() to %s:%u returned %d",
++                   conn->base_domain, conn->port, conn->sock);
++        if (conn->sock == -1)
++            return XMPP_EINT;
++        if (conn->ka_timeout || conn->ka_interval)
++            sock_set_keepalive(conn->sock, conn->ka_timeout, conn->ka_interval);
++
++        /* setup handler */
++        conn->conn_handler = callback;
++        conn->userdata = userdata;
++
++        open_handler = conn->is_raw
++                           ? auth_handle_open_stub
++                           : type == XMPP_CLIENT ? auth_handle_open
++                                                 : auth_handle_component_open;
++        conn_prepare_reset(conn, open_handler);
++
++        /* FIXME: it could happen that the connect returns immediately as
++         * successful, though this is pretty unlikely.  This would be a little
++         * hard to fix, since we'd have to detect and fire off the callback
++         * from within the event loop */
++
++        conn->state = XMPP_STATE_CONNECTING;
++        conn->timeout_stamp = time_stamp();
++        xmpp_debug(conn->ctx, "xmpp", "Attempting to connect to %s", host);
++    }
+ 
+     return 0;
+ }
+diff --git a/src/event.c b/src/event.c
+index 390d5a1..2319a8e 100644
+--- a/src/event.c
++++ b/src/event.c
+@@ -172,6 +172,7 @@ void xmpp_run_once(xmpp_ctx_t *ctx, const unsigned long timeout)
+ 
+         switch (conn->state) {
+         case XMPP_STATE_CONNECTING:
++        case XMPP_STATE_PROXY:
+             /* connect has been called and we're waiting for it to complete */
+             /* connection will give us write or error events */
+ 
+@@ -250,6 +251,108 @@ void xmpp_run_once(xmpp_ctx_t *ctx, const unsigned long timeout)
+                 conn_established(conn);
+             }
+ 
++            break;
++        case XMPP_STATE_PROXY:
++            if (FD_ISSET(conn->sock, &wfds)) {
++                /* connection complete */
++
++                /* check for error */
++                ret = sock_connect_error(conn->sock);
++                if (ret != 0) {
++                    /* connection failed */
++                    xmpp_debug(ctx, "xmpp", "connection failed, error %d", ret);
++                    conn_disconnect(conn);
++                    break;
++                }
++
++                int prog;
++
++                /* Request forwarding */
++                prog = snprintf(buf, 4096, "CONNECT %s:%d HTTP/1.0\r\n", conn->base_domain, conn->port);
++
++                if (conn->proxy_user) {
++                    /* Authenticate proxy user */
++                    char auth_buf[0x48];
++                    int auth_len = 0;
++
++                    auth_len =
++                        snprintf(auth_buf, 0x48, "%s:%s", conn->proxy_user, conn->proxy_pass ? conn->proxy_pass : "");
++
++                    char *enc = xmpp_base64_encode(
++                        ctx, (unsigned char *)auth_buf, auth_len);
++
++                    if (!enc) {
++                        xmpp_debug(ctx, "xmpp", "make request failed");
++                        conn_disconnect(conn);
++                        break;
++                    }
++
++                    prog +=
++                        snprintf(buf + prog, 4096 - prog, "Proxy-Authorization: Basic %s\r\n", enc);
++
++                    xmpp_free(ctx, enc);
++                }
++
++                prog += snprintf(buf + prog, 4096 - prog, "\r\n");
++
++                ret = sock_write(conn->sock, buf, prog);
++
++                if (ret < 0) {
++                    /* send failed */
++                    xmpp_debug(ctx, "xmpp", "send connect failed");
++                    conn_disconnect(conn);
++                    break;
++                }
++
++                for (int i = 0; i < 0x1000; i++) {
++                    max = conn->sock + 1;
++                    FD_ZERO(&rfds);
++                    FD_SET(conn->sock, &rfds);
++                    ret = select(max, &rfds, NULL, NULL, NULL);
++
++                    if (ret < 0) {
++                        xmpp_debug(ctx, "xmpp", "send connect failed");
++                        break;
++                    }
++
++                    ret = sock_read(conn->sock, buf + i, 1);
++
++                    if (ret < 0) {
++                        xmpp_debug(ctx, "xmpp", "send connect failed");
++                        break;
++                    }
++
++                    if (i >= 4 && memcmp(buf + i - 4, "\r\n\r\n", 4) == 0) {
++                        buf[i] = '\0';
++                        xmpp_debug(ctx, "xmpp", "proxy response: \n%s", buf);
++
++                        int mj, mi;
++                        if (sscanf(buf, "HTTP/%d.%d %d", &mj, &mi, &ret) != 3)
++                            ret = -1;
++
++                        if (ret != 200) {
++                            if (ret == -1) {
++                                xmpp_debug(ctx, "xmpp", "failed to parse proxy response");
++                            } else {
++                                xmpp_debug(ctx, "xmpp", "proxy error %d", ret);
++                            }
++                        } else {
++                            xmpp_debug(ctx, "xmpp", "proxy connection successful");
++                        }
++                        break;
++                    }
++                }
++
++                if (ret < 0) {
++                    conn_disconnect(conn);
++                    break;
++                }
++
++                conn->state = XMPP_STATE_CONNECTED;
++                xmpp_debug(ctx, "xmpp", "connection successful");
++                conn_established(conn);
++            }
++
+             break;
+         case XMPP_STATE_CONNECTED:
+             if (FD_ISSET(conn->sock, &rfds) || (conn->tls && tls_pending(conn->tls))) {
+diff --git a/src/resolver.c b/src/resolver.c
+index 1582b14..11f7df9 100644
+--- a/src/resolver.c
++++ b/src/resolver.c
+@@ -13,7 +13,7 @@
+  *  DNS resolver.
+  */
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__SWITCH__)
+ #include <netinet/in.h>
+ #include <arpa/nameser.h>
+ #include <resolv.h>             /* res_query */
+@@ -229,6 +229,9 @@ static void resolver_srv_list_sort(resolver_srv_rr_t **srv_rr_list)
+ int resolver_srv_lookup_buf(xmpp_ctx_t *ctx, const unsigned char *buf,
+                             size_t len, resolver_srv_rr_t **srv_rr_list)
+ {
++#ifdef __SWITCH__
++    return 0;
++#else
+     unsigned i;
+     unsigned j;
+     unsigned name_len;
+@@ -295,11 +298,15 @@ int resolver_srv_lookup_buf(xmpp_ctx_t *ctx, const unsigned char *buf,
+     resolver_srv_list_sort(srv_rr_list);
+ 
+     return *srv_rr_list != NULL ? XMPP_DOMAIN_FOUND : XMPP_DOMAIN_NOT_FOUND;
++#endif
+ }
+ 
+ int resolver_srv_lookup(xmpp_ctx_t *ctx, const char *service, const char *proto,
+                         const char *domain, resolver_srv_rr_t **srv_rr_list)
+ {
++#ifdef __SWITCH__
++    return 0;
++#else
+     char fulldomain[2048];
+     unsigned char buf[65535];
+     int len;
+@@ -323,6 +330,7 @@ int resolver_srv_lookup(xmpp_ctx_t *ctx, const char *service, const char *proto,
+         set = resolver_srv_lookup_buf(ctx, buf, (size_t)len, srv_rr_list);
+ 
+     return set;
++#endif
+ }
+ 
+ void resolver_srv_free(xmpp_ctx_t *ctx, resolver_srv_rr_t *srv_rr_list)
+diff --git a/src/sock.c b/src/sock.c
+index 78a3d1f..ec34554 100644
+--- a/src/sock.c
++++ b/src/sock.c
+@@ -75,12 +75,13 @@ sock_t sock_connect(const char * const host, const unsigned short port)
+     char service[6];
+     struct addrinfo *res, *ainfo, hints;
+     int err;
++    int buffer_size = 0x1000;
+ 
+     xmpp_snprintf(service, 6, "%u", port);
+ 
+     memset(&hints, 0, sizeof(struct addrinfo));
+     hints.ai_family = AF_UNSPEC;
+-#ifdef AI_ADDRCONFIG
++#if defined(AI_ADDRCONFIG) && defined(__SWITCH__)
+     hints.ai_flags = AI_ADDRCONFIG;
+ #endif /* AI_ADDRCONFIG */
+     hints.ai_protocol = IPPROTO_TCP;
+@@ -95,12 +96,23 @@ sock_t sock_connect(const char * const host, const unsigned short port)
+         if (sock < 0)
+             continue;
+ 
++#ifdef __SWITCH__
++        setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
++        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
++        sock_set_keepalive(sock, 600, 60);
++
++        err = connect(sock, ainfo->ai_addr, ainfo->ai_addrlen);
++        if (err == 0 || _in_progress(sock_error()))
++            break;
++#else
++
+         err = sock_set_nonblocking(sock);
+         if (err == 0) {
+             err = connect(sock, ainfo->ai_addr, ainfo->ai_addrlen);
+             if (err == 0 || _in_progress(sock_error()))
+                 break;
+         }
++#endif
+         sock_close(sock);
+     }
+     freeaddrinfo(res);
+@@ -113,6 +125,9 @@ int sock_set_keepalive(const sock_t sock, int timeout, int interval)
+ {
+     int ret;
+     int optval = (timeout && interval) ? 1 : 0;
++#ifdef __SWITCH__
++    int retries = 3;
++#endif
+ 
+     /* This function doesn't change maximum number of keepalive probes */
+ 
+@@ -124,6 +139,20 @@ int sock_set_keepalive(const sock_t sock, int timeout, int interval)
+     ka.keepalivetime = timeout * 1000;
+     ka.keepaliveinterval = interval * 1000;
+     ret = WSAIoctl(sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &dw, NULL, NULL);
++#elif __SWITCH__
++    ret = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
++    if (ret < 0)
++        return ret;
++
++    if (optval) {
++        ret = setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &timeout, sizeof(timeout));
++        if (ret < 0)
++            return ret;
++        ret = setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
++        if (ret < 0)
++            return ret;
++        ret = setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &retries, sizeof(retries));
++    }
+ #else
+     ret = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+     if (ret < 0)
+diff --git a/src/tls_libnx.c b/src/tls_libnx.c
+new file mode 100644
+index 0000000..cf6d3f1
+--- /dev/null
++++ b/src/tls_libnx.c
+@@ -0,0 +1,195 @@
++/* tls_libnx.c
++** strophe XMPP client library -- TLS abstraction libnx impl.
++**
++** Copyright (C) 2005-2009 Collecta, Inc.
++**
++**  This software is provided AS-IS with no warranty, either express
++**  or implied.
++**
++**  This program is dual licensed under the MIT and GPLv3 licenses.
++*/
++
++/** @file
++ *  TLS implementation with libnx SSL wrapper.
++ */
++#include <switch.h>
++#include <string.h>
++
++#include "common.h"
++#include "tls.h"
++#include "sock.h"
++
++struct _tls {
++    xmpp_ctx_t *ctx;
++    sock_t sock;
++    SslContext c;
++    SslConnection conn;
++    int fd;
++    int error;
++};
++
++void tls_initialize(void)
++{
++    /* ... */
++}
++
++void tls_shutdown(void)
++{
++    /* ... */
++}
++
++tls_t *tls_new(xmpp_conn_t *conn)
++{
++    Result rc = 0;
++    tls_t *p = NULL;
++
++    p = xmpp_alloc(conn->ctx, sizeof(*p));
++
++    if (p) {
++        memset(p, 0, sizeof(*p));
++        p->ctx = conn->ctx;
++        p->sock = conn->sock;
++
++        rc = sslCreateContext(&p->c, SslVersion_Auto);
++        if (R_SUCCEEDED(rc)) {
++            u64 id = 0;
++            sslContextRegisterInternalPki(
++                &p->c, SslInternalPki_DeviceClientCertDefault, &id);
++            rc = sslContextCreateConnection(&p->c, &p->conn);
++            if (R_SUCCEEDED(rc)) {
++                u32 verify_option =
++                    hosversionBefore(5, 0, 0)
++                        ? 0
++                        : SslVerifyOption_PeerCa | SslVerifyOption_HostName;
++                rc = sslConnectionSetVerifyOption(&p->conn, verify_option);
++                if (R_SUCCEEDED(rc)) {
++                    p->fd = socketSslConnectionSetSocketDescriptor(&p->conn,
++                                                                   conn->sock);
++                    if (p->fd < 0)
++                        rc = socketGetLastResult();
++                    if (R_SUCCEEDED(rc)) {
++                        rc = sslConnectionSetIoMode(&p->conn,
++                                                    SslIoMode_NonBlocking);
++                        if (R_SUCCEEDED(rc))
++                            return p;
++                    }
++                }
++                sslConnectionClose(&p->conn);
++            }
++            sslContextClose(&p->c);
++        }
++        xmpp_free(p->ctx, p);
++        p = NULL;
++    }
++    return p;
++}
++
++void tls_free(tls_t *tls)
++{
++    sslConnectionClose(&tls->conn);
++    sslContextClose(&tls->c);
++    xmpp_free(tls->ctx, tls);
++}
++
++int tls_set_credentials(tls_t *tls, const char *cafilename)
++{
++    Result rc = 0;
++
++    rc = sslConnectionSetHostName(&tls->conn, cafilename, strlen(cafilename));
++    if (R_FAILED(rc)) {
++        tls->error = R_DESCRIPTION(rc);
++        return 0;
++    }
++
++    if (hosversionBefore(5, 0, 0)) {
++        rc = sslConnectionSetVerifyOption(&tls->conn, SslVerifyOption_HostName);
++        if (R_FAILED(rc)) {
++            tls->error = R_DESCRIPTION(rc);
++            return 0;
++        }
++    }
++
++    return 1;
++}
++
++int tls_start(tls_t *tls)
++{
++    Result rc = 0;
++
++    while (rc = sslConnectionDoHandshake(&tls->conn, NULL, NULL, NULL, 0),
++           R_VALUE(rc) == 0x1987b) {
++        svcSleepThread(100000000);
++    }
++
++    if (R_FAILED(rc)) {
++        tls->error = R_DESCRIPTION(rc);
++        return 0;
++    }
++
++    return 1;
++}
++
++int tls_stop(tls_t *tls)
++{
++    (void)tls;
++
++    return 1;
++}
++
++int tls_error(tls_t *tls)
++{
++    return tls->error;
++}
++
++int tls_pending(tls_t *tls)
++{
++    s32 pending = 0;
++    Result rc = 0;
++
++    rc = sslConnectionPending(&tls->conn, &pending);
++
++    if (R_FAILED(rc)) {
++        tls->error = R_DESCRIPTION(rc);
++        return -1;
++    }
++
++    return pending;
++}
++
++int tls_read(tls_t *tls, void *const buff, const size_t len)
++{
++    u32 read_bytes = 0;
++    Result rc = sslConnectionRead(&tls->conn, buff, len, &read_bytes);
++
++    if (R_FAILED(rc)) {
++        tls->error = R_DESCRIPTION(rc);
++        return -1;
++    }
++
++    return read_bytes;
++}
++
++int tls_write(tls_t *tls, const void *const buff, const size_t len)
++{
++    u32 written_bytes = 0;
++    Result rc = sslConnectionWrite(&tls->conn, buff, len, &written_bytes);
++
++    if (R_FAILED(rc)) {
++        tls->error = R_DESCRIPTION(rc);
++        return -1;
++    }
++
++    return written_bytes;
++}
++
++int tls_clear_pending_write(tls_t *tls)
++{
++    (void)tls;
++
++    return 0;
++}
++
++int tls_is_recoverable(int error)
++{
++    return error == 0xcc || (error == 0 || error == 0x73);
++}
+\ No newline at end of file
+diff --git a/strophe.h b/strophe.h
+index d9f048f..5030bf8 100644
+--- a/strophe.h
++++ b/strophe.h
+@@ -233,6 +233,8 @@ const char *xmpp_conn_get_bound_jid(const xmpp_conn_t * const conn);
+ void xmpp_conn_set_jid(xmpp_conn_t * const conn, const char * const jid);
+ const char *xmpp_conn_get_pass(const xmpp_conn_t * const conn);
+ void xmpp_conn_set_pass(xmpp_conn_t * const conn, const char * const pass);
++void xmpp_conn_set_proxy(xmpp_conn_t *const conn, const char *const host, const int port);
++void xmpp_conn_set_proxy_auth(xmpp_conn_t *const conn, const char *const user, const char *const pass);
+ xmpp_ctx_t *xmpp_conn_get_context(xmpp_conn_t * const conn);
+ void xmpp_conn_disable_tls(xmpp_conn_t * const conn);
+ int xmpp_conn_is_secured(xmpp_conn_t * const conn);
